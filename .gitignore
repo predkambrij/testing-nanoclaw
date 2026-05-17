@@ -1,0 +1,4 @@
+onecli/
+.env
+nanoclaw/
+res/gen_env.sh

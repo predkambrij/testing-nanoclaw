@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$ROOT_DIR/../.env"
+
+umask 077
+cat > "$ENV_FILE" <<'EOF'
+ONECLI_URL=http://onecli:10254
+ONECLI_API_KEY=
+ZAI_API_KEY=<your API key>
+
+ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
+API_TIMEOUT_MS=3000000
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5
+ANTHROPIC_DEFAULT_SONNET_MODEL=glm-5
+ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-5
+CLAUDE_CODE_SUBAGENT_MODEL=glm-5
+
+# postgres
+ONECLI_POSTGRES_USER=onecli
+ONECLI_POSTGRES_PASSWORD=onecli
+ONECLI_POSTGRES_DB=onecli
+
+# onecli app
+
+# agent / nanoclaw
+TZ=UTC
+EOF
+

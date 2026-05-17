@@ -1,0 +1,253 @@
+services:
+  onecli-postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${ONECLI_POSTGRES_USER:?run gen_env.sh first}
+      POSTGRES_PASSWORD: ${ONECLI_POSTGRES_PASSWORD:?run gen_env.sh first}
+      POSTGRES_DB: ${ONECLI_POSTGRES_DB:?run gen_env.sh first}
+    volumes:
+      - onecli-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 10
+
+  onecli:
+    build:
+      context: ./onecli
+      dockerfile: docker/Dockerfile
+    image: nanoclaw-onecli-compose:latest
+    restart: unless-stopped
+    depends_on:
+      onecli-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${ONECLI_POSTGRES_USER:?run gen_env.sh first}:${ONECLI_POSTGRES_PASSWORD:?run gen_env.sh first}@onecli-postgres:5432/${ONECLI_POSTGRES_DB:?run gen_env.sh first}
+      NEXTAUTH_SECRET: ""
+      NEXT_PUBLIC_APP_URL: http://localhost:10254
+      NEXT_PUBLIC_API_URL: http://localhost:10255
+      APP_URL: http://localhost:10254
+      API_BASE_URL: localhost:10255
+      GATEWAY_BASE_URL: host.docker.internal:10255
+    env_file:
+      - path: .env
+        required: true
+    ports:
+      - "127.0.0.1:10254:10254"
+      - "0.0.0.0:10255:10255"
+    entrypoint: ["/app/onecli-entrypoint.sh"]
+    volumes:
+      - ./res/onecli-entrypoint.sh:/app/onecli-entrypoint.sh:ro
+      - onecli-app-data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:10254/api/health >/dev/null && wget -qO- http://127.0.0.1:10255/healthz >/dev/null" ]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 6
+
+  nanoclaw-state-init:
+    image: busybox
+    restart: "no"
+    volumes:
+      - nanoclaw-state:/state
+    command: mkdir -p /state/data /state/groups /state/store /state/logs /state/tmp
+
+  agent-image:
+    build:
+      context: ./nanoclaw/container
+      args:
+        INSTALL_CJK_FONTS: "false"
+    image: nanoclaw-agent-compose:latest
+    entrypoint: ["/bin/true"]
+    restart: "no"
+
+  nanoclaw:
+    build:
+      context: ./nanoclaw
+      dockerfile_inline: |
+        FROM node:22-slim
+
+        ENV PNPM_HOME="/pnpm"
+        ENV PATH="$${PNPM_HOME}:$${PATH}"
+
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+            ca-certificates \
+            docker.io \
+            gosu \
+            git \
+            g++ \
+            make \
+            python3 \
+          && rm -rf /var/lib/apt/lists/*
+
+        RUN mv /usr/bin/docker /usr/bin/docker-real && cat > /usr/local/bin/docker <<'EOF'
+        #!/bin/sh
+        set -eu
+
+        NANOCLAW_HOST_SOURCE_ROOT="$$(/usr/bin/docker-real inspect --format '{{range .Mounts}}{{if eq .Destination "/home/user/nanoclaw"}}{{.Source}}{{end}}{{end}}' "$$(hostname)")"
+
+        rewrite_volume() {
+          spec="$$1"
+          src="$${spec%%:*}"
+          rest="$${spec#*:}"
+          case "$$src" in
+            /home/user/nanoclaw/data/*|/home/user/nanoclaw/data|\
+            /home/user/nanoclaw/groups/*|/home/user/nanoclaw/groups|\
+            /home/user/nanoclaw/store/*|/home/user/nanoclaw/store|\
+            /home/user/nanoclaw/logs/*|/home/user/nanoclaw/logs)
+              printf '%s:%s' "$${NANOCLAW_HOST_STATE_ROOT}$${src#/home/user/nanoclaw}" "$$rest"
+              ;;
+            /home/user/nanoclaw/container/*|/home/user/nanoclaw/container)
+              printf '%s:%s' "$${NANOCLAW_HOST_SOURCE_ROOT}/container$${src#/home/user/nanoclaw/container}" "$$rest"
+              ;;
+            /tmp/*|/tmp)
+              printf '%s:%s' "$${NANOCLAW_HOST_STATE_ROOT}/tmp$${src#/tmp}" "$$rest"
+              ;;
+            *)
+              printf '%s' "$$spec"
+              ;;
+          esac
+        }
+
+        if [ "$${1:-}" = "run" ]; then
+          tmp="$$(mktemp)"
+          trap 'rm -f "$$tmp"' EXIT
+          printf '%s\n' "run" > "$$tmp"
+          shift
+
+          append_env() {
+            name="$$1"
+            eval "value=\$${$$name:-}"
+            if [ -n "$$value" ]; then
+              printf '%s\n%s=%s\n' "-e" "$$name" "$$value" >> "$$tmp"
+            fi
+          }
+
+          if [ -n "$${ANTHROPIC_BASE_URL:-}" ]; then
+            append_env ANTHROPIC_BASE_URL
+          fi
+          append_env API_TIMEOUT_MS
+          append_env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+          append_env ANTHROPIC_DEFAULT_OPUS_MODEL
+          append_env ANTHROPIC_DEFAULT_SONNET_MODEL
+          append_env ANTHROPIC_DEFAULT_HAIKU_MODEL
+          append_env CLAUDE_CODE_SUBAGENT_MODEL
+
+          while [ "$$#" -gt 0 ]; do
+            case "$$1" in
+              -e|--env)
+                flag="$$1"
+                shift
+                printf '%s\n%s\n' "$$flag" "$$1" >> "$$tmp"
+                ;;
+              -v|--volume)
+                flag="$$1"
+                shift
+                rewritten="$$(rewrite_volume "$$1")"
+                printf '%s\n%s\n' "$$flag" "$$rewritten" >> "$$tmp"
+                ;;
+              -v*)
+                value="$${1#-v}"
+                rewritten="$$(rewrite_volume "$$value")"
+                printf '%s\n' "-v$$rewritten" >> "$$tmp"
+                ;;
+              --volume=*)
+                value="$${1#--volume=}"
+                rewritten="$$(rewrite_volume "$$value")"
+                printf '%s\n' "--volume=$$rewritten" >> "$$tmp"
+                ;;
+              *)
+                printf '%s\n' "$$1" >> "$$tmp"
+                ;;
+            esac
+            shift
+          done
+          set --
+          while IFS= read -r arg; do
+            set -- "$$@" "$$arg"
+          done < "$$tmp"
+        fi
+
+        exec /usr/bin/docker-real "$$@"
+        EOF
+        RUN chmod +x /usr/local/bin/docker
+
+        RUN corepack enable && corepack prepare pnpm@10.33.0 --activate
+
+        WORKDIR /home/user/nanoclaw
+    depends_on:
+      onecli:
+        condition: service_healthy
+      agent-image:
+        condition: service_completed_successfully
+      nanoclaw-state-init:
+        condition: service_completed_successfully
+    command: >
+      sh -lc "sock_gid=$$(stat -c %g /var/run/docker.sock);
+      getent group $$sock_gid >/dev/null || groupadd -g $$sock_gid dockerhost;
+      sock_group=$$(getent group $$sock_gid | cut -d: -f1);
+      usermod -aG $$sock_group node;
+      chown -R node:node /home/user/nanoclaw/data /home/user/nanoclaw/groups /home/user/nanoclaw/store /home/user/nanoclaw/logs /home/user/nanoclaw/node_modules /home/user/nanoclaw/dist /home/user/nanoclaw/.pnpm-store /tmp /pnpm;
+      exec gosu node sh -lc 'pnpm install --frozen-lockfile && pnpm run build && exec pnpm start'"
+    environment:
+      CONTAINER_IMAGE: nanoclaw-agent-compose:latest
+      CONTAINER_IMAGE_BASE: nanoclaw-agent-compose
+      DOCKER_HOST: unix:///var/run/docker.sock
+      HUSKY: "0"
+      LOG_LEVEL: info
+      ONECLI_URL: ${ONECLI_URL:?run gen_env.sh first}
+      ONECLI_API_KEY: ${ONECLI_API_KEY?run gen_env.sh first}
+      TZ: ${TZ:?run gen_env.sh first}
+      NANOCLAW_HOST_STATE_ROOT: /var/lib/docker/volumes/nanoclaw-state/_data
+    env_file:
+      - path: .env
+        required: true
+    volumes:
+      - ./nanoclaw:/home/user/nanoclaw
+      - type: volume
+        source: nanoclaw-state
+        target: /home/user/nanoclaw/data
+        volume:
+          subpath: data
+      - type: volume
+        source: nanoclaw-state
+        target: /home/user/nanoclaw/groups
+        volume:
+          subpath: groups
+      - type: volume
+        source: nanoclaw-state
+        target: /home/user/nanoclaw/store
+        volume:
+          subpath: store
+      - type: volume
+        source: nanoclaw-state
+        target: /home/user/nanoclaw/logs
+        volume:
+          subpath: logs
+      - nanoclaw-node-modules:/home/user/nanoclaw/node_modules
+      - nanoclaw-dist:/home/user/nanoclaw/dist
+      - nanoclaw-pnpm-project-store:/home/user/nanoclaw/.pnpm-store
+      - /var/run/docker.sock:/var/run/docker.sock
+      - type: volume
+        source: nanoclaw-state
+        target: /tmp
+        volume:
+          subpath: tmp
+      - nanoclaw-pnpm-store:/pnpm/store
+    restart: unless-stopped
+
+volumes:
+  onecli-postgres-data:
+  onecli-app-data:
+  nanoclaw-state:
+    name: nanoclaw-state
+  nanoclaw-node-modules:
+  nanoclaw-dist:
+  nanoclaw-pnpm-project-store:
+  nanoclaw-pnpm-store:
